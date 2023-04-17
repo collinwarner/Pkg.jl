@@ -1451,17 +1451,17 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
                     is_direct_dep = pkg in direct_deps
 
                     # stderr monitoring
-                    #iob = Base.BufferStream()
-                    #t_monitor = @async monitor_stderr(pkg, iob)
+                    iob = Base.BufferStream()
+                    t_monitor = @async monitor_stderr(pkg, iob)
 
-                    #_name = haskey(exts, pkg) ? string(exts[pkg], " → ", pkg.name) : pkg.name
-                    #name = is_direct_dep ? _name : string(color_string(_name, :light_black))
-                    #!fancyprint && lock(print_lock) do
-                    #    isempty(pkg_queue) && printpkgstyle(io, :Precompiling, target)
-                    #end
+                    _name = haskey(exts, pkg) ? string(exts[pkg], " → ", pkg.name) : pkg.name
+                    name = is_direct_dep ? _name : string(color_string(_name, :light_black))
+                    !fancyprint && lock(print_lock) do
+                        isempty(pkg_queue) && printpkgstyle(io, :Precompiling, target)
+                    end
                     push!(pkg_queue, pkg)
                     started[pkg] = true
-                    #fancyprint && notify(first_started)
+                    fancyprint && notify(first_started)
                     if interrupted_or_done.set
                         notify(was_processed[pkg])
                         Base.release(parallel_limiter)
@@ -1476,27 +1476,26 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
                         if ret isa Base.PrecompilableError
                             push!(precomperr_deps, pkg)
                             precomp_queue!(get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid))
-                            #!fancyprint && lock(print_lock) do
-                            #    println(io, t_str, color_string("  ? ", Base.warn_color()), name)
-                            #end
+                            !fancyprint && lock(print_lock) do
+                                println(io, t_str, color_string("  ? ", Base.warn_color()), name)
+                            end
                         else
                             queued && precomp_dequeue!(get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid))
-                            #!fancyprint && lock(print_lock) do
-                            
-                            #println(io, t_str, color_string("  ✓ ", loaded ? Base.warn_color() : :green), name)
-                            #end
+                            !fancyprint && lock(print_lock) do
+                                println(io, t_str, color_string("  ✓ ", loaded ? Base.warn_color() : :green), name)
+                            end
                             was_recompiled[pkg] = true
                         end
                         loaded && (n_loaded += 1)
                     catch err
-                        #close(iob)
-                        #wait(t_monitor)
+                        close(iob)
+                        wait(t_monitor)
                         if err isa ErrorException || (err isa ArgumentError && startswith(err.msg, "Invalid header in cache file"))
                             failed_deps[pkg] = (strict || is_direct_dep) ? string(sprint(showerror, err), "\n", get(stderr_outputs, pkg, "")) : ""
-                            #delete!(stderr_outputs, pkg) # so it's not shown as warnings, given error report
-                            #!fancyprint && lock(print_lock) do
-                            #    println(io, timing ? " "^9 : "", color_string("  ✗ ", Base.error_color()), name)
-                            #end
+                            delete!(stderr_outputs, pkg) # so it's not shown as warnings, given error report
+                            !fancyprint && lock(print_lock) do
+                                println(io, timing ? " "^9 : "", color_string("  ✗ ", Base.error_color()), name)
+                            end
                             queued && precomp_dequeue!(get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid))
                             precomp_suspend!(get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid))
                         else

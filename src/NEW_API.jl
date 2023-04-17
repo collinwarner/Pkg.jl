@@ -1413,30 +1413,40 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
         Base.LOADING_CACHE[] = Base.LoadingCache()
     end
 
-    #@show depsmap
-    ## precompilation loop
+    inverse_depsmap = Dict{Base.PkgId, Set{Base.PkgId}}()
+    no_dependency_queue = Vector{Base.PkgId}()
     for (pkg, deps) in depsmap
-        #println("dependency")
-        #@show (pkg, deps)
-        paths = Base.find_all_in_cache_path(pkg)
-        sourcepath = Base.locate_package(pkg)
-        if sourcepath === nothing
-            failed_deps[pkg] = "Error: Missing source file for $(pkg)"
-            notify(was_processed[pkg])
-            continue
+        if length(deps) == 0
+            append!(no_dependency_queue, pkg)
+        else
+            for dep in deps
+                push!(inverse_depsmap[dep], pkg)
+            end
         end
-        # Heuristic for when precompilation is disabled
-        if occursin(r"\b__precompile__\(\s*false\s*\)", read(sourcepath, String))
-            notify(was_processed[pkg])
-            continue
-        end
+    end
+    try
+        #proof of concept single threaded case
+        while !no_dependency_queue.empty()
+            pkg = popfirst!(no_dependency_queue)
 
-        task = @async begin
+            paths = Base.find_all_in_cache_path(pkg)
+            sourcepath = Base.locate_package(pkg)
+            if sourcepath === nothing
+                failed_deps[pkg] = "Error: Missing source file for $(pkg)"
+                #notify(was_processed[pkg])
+                continue
+            end
+            # Heuristic for when precompilation is disabled
+            if occursin(r"\b__precompile__\(\s*false\s*\)", read(sourcepath, String))
+                #notify(was_processed[pkg])
+                continue
+            end
+
             try
                 loaded = haskey(Base.loaded_modules, pkg)
-                for dep in deps # wait for deps to finish
+                #=for dep in deps # wait for deps to finish
                     wait(was_processed[dep])
-                end
+                end =#
 
                 pkgspec = get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid)
                 suspended = precomp_suspended(pkgspec)
@@ -1447,25 +1457,26 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
                 any_dep_recompiled = any(map(dep->was_recompiled[dep], deps))
                 is_stale = true
                 if !circular && (queued || any_dep_recompiled || (!suspended && (is_stale = _is_stale!(stale_cache, paths, sourcepath))))
-                    Base.acquire(parallel_limiter)
+                    #Base.acquire(parallel_limiter)
                     is_direct_dep = pkg in direct_deps
 
                     # stderr monitoring
-                    #iob = Base.BufferStream()
-                    #t_monitor = @async monitor_stderr(pkg, iob)
+                    iob = Base.BufferStream()
+                    t_monitor = @async monitor_stderr(pkg, iob)
 
-                    #_name = haskey(exts, pkg) ? string(exts[pkg], " → ", pkg.name) : pkg.name
-                    #name = is_direct_dep ? _name : string(color_string(_name, :light_black))
-                    #!fancyprint && lock(print_lock) do
-                    #    isempty(pkg_queue) && printpkgstyle(io, :Precompiling, target)
-                    #end
+                    _name = haskey(exts, pkg) ? string(exts[pkg], " → ", pkg.name) : pkg.name
+                    name = is_direct_dep ? _name : string(color_string(_name, :light_black))
+                    !fancyprint && lock(print_lock) do
+                        isempty(pkg_queue) && printpkgstyle(io, :Precompiling, target)
+                    end
                     push!(pkg_queue, pkg)
                     started[pkg] = true
-                    #fancyprint && notify(first_started)
+                    fancyprint && notify(first_started)
                     if interrupted_or_done.set
-                        notify(was_processed[pkg])
-                        Base.release(parallel_limiter)
-                        return
+                        #notify(was_processed[pkg])
+                        #Base.release(parallel_limiter)
+                        #return
+                        continue
                     end
                     try
                         t = @elapsed ret = Logging.with_logger(Logging.NullLogger()) do
@@ -1476,59 +1487,70 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
                         if ret isa Base.PrecompilableError
                             push!(precomperr_deps, pkg)
                             precomp_queue!(get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid))
-                            #!fancyprint && lock(print_lock) do
-                            #    println(io, t_str, color_string("  ? ", Base.warn_color()), name)
-                            #end
+                            !fancyprint && lock(print_lock) do
+                                println(io, t_str, color_string("  ? ", Base.warn_color()), name)
+                            end
                         else
                             queued && precomp_dequeue!(get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid))
-                            #!fancyprint && lock(print_lock) do
-                            
-                            #println(io, t_str, color_string("  ✓ ", loaded ? Base.warn_color() : :green), name)
-                            #end
+                            !fancyprint && lock(print_lock) do
+                                println(io, t_str, color_string("  ✓ ", loaded ? Base.warn_color() : :green), name)
+                            end
                             was_recompiled[pkg] = true
                         end
                         loaded && (n_loaded += 1)
                     catch err
-                        #close(iob)
-                        #wait(t_monitor)
+                        close(iob)
+                        wait(t_monitor)
                         if err isa ErrorException || (err isa ArgumentError && startswith(err.msg, "Invalid header in cache file"))
                             failed_deps[pkg] = (strict || is_direct_dep) ? string(sprint(showerror, err), "\n", get(stderr_outputs, pkg, "")) : ""
-                            #delete!(stderr_outputs, pkg) # so it's not shown as warnings, given error report
-                            #!fancyprint && lock(print_lock) do
-                            #    println(io, timing ? " "^9 : "", color_string("  ✗ ", Base.error_color()), name)
-                            #end
+                            delete!(stderr_outputs, pkg) # so it's not shown as warnings, given error report
+                            !fancyprint && lock(print_lock) do
+                                println(io, timing ? " "^9 : "", color_string("  ✗ ", Base.error_color()), name)
+                            end
                             queued && precomp_dequeue!(get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid))
                             precomp_suspend!(get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid))
                         else
                             rethrow()
                         end
                     finally
-                        Base.release(parallel_limiter)
+                        #Base.release(parallel_limiter)
                     end
                 else
                     is_stale || (n_already_precomp += 1)
                     suspended && push!(skipped_deps, pkg)
                 end
                 n_done += 1
-                notify(was_processed[pkg])
+                #notify(was_processed[pkg])
             catch err_outer
                 handle_interrupt(err_outer)
-                notify(was_processed[pkg])
+                #notify(was_processed[pkg])
             finally
-                filter!(!istaskdone, tasks)
-                length(tasks) == 1 && notify(interrupted_or_done)
+                #filter!(!istaskdone, tasks)
+                #length(tasks) == 1 && notify(interrupted_or_done)
             end
+
+            # add new task to queue
+            for dep in inverse_depsmap[pkg]
+                setdiff!(depsmap[dep], [pkg])
+                if depsmap[dep].empty()
+                    push!(no_dependency_queue, dep)
+                end
+            end
+            #push!(tasks, task)
         end
-        push!(tasks, task)
-    end
-    isempty(tasks) && notify(interrupted_or_done)
-    try
-        wait(interrupted_or_done)
     catch err
         handle_interrupt(err)
     finally
         Base.LOADING_CACHE[] = nothing
     end
+    #isempty(tasks) && notify(interrupted_or_done)
+    #=try
+        wait(interrupted_or_done)
+    catch err
+        handle_interrupt(err)
+    finally
+        Base.LOADING_CACHE[] = nothing
+    end=#
     notify(first_started) # in cases of no-op or !fancyprint
     save_precompile_state() # save lists to scratch space
     fancyprint && wait(t_print)
