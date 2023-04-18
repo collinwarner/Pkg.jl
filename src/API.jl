@@ -1112,11 +1112,28 @@ function get_or_make_pkgspec(pkgspecs::Vector{PackageSpec}, ctx::Context, uuid)
     end
 end
 
+#using Profile
+#=function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool=false,
+                    strict::Bool=false, warn_loaded = true, already_instantiated = false, timing::Bool = false,
+                    _from_loading::Bool=false, kwargs...)
+ 
+#    println("Calling precompile")
+#    Profile.init(n=10^8, delay=0.001)
+#    @profile precompile_profile(ctx, pkgs;internal_call=internal_call,
+                                strict=strict, warn_loaded=warn_loaded,
+                                already_instantiated=already_instantiated,
+                                timing=timing, _from_loading=_from_loading,
+                                kwargs...)
+    
+    open("precompile_profile.txt", "w") do s
+        Profile.print(IOContext(s, :displaysize => (24, 500)))
+    end
+end =#
 
 function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool=false,
                     strict::Bool=false, warn_loaded = true, already_instantiated = false, timing::Bool = false,
                     _from_loading::Bool=false, kwargs...)
-    Context!(ctx; kwargs...)
+   Context!(ctx; kwargs...)
     already_instantiated || instantiate(ctx; allow_autoprecomp=false, kwargs...)
     time_start = time_ns()
 
@@ -1197,14 +1214,14 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
     end
 
     # initialize signalling
-    started = Dict{Base.PkgId,Bool}()
+    #started = Dict{Base.PkgId,Bool}()
     #was_processed = Dict{Base.PkgId,Base.Event}()
-    was_processed_bool = Dict{Base.PkgId, Bool}()
+    #was_processed_bool = Dict{Base.PkgId, Bool}()
     was_recompiled = Dict{Base.PkgId,Bool}()
     for pkgid in keys(depsmap)
-        started[pkgid] = false
+        #started[pkgid] = false
         #was_processed[pkgid] = Base.Event()
-        was_processed_bool[pkgid] = false
+        #was_processed_bool[pkgid] = false
         was_recompiled[pkgid] = false
         push!(pkg_specs, get_or_make_pkgspec(pkg_specs, ctx, pkgid.uuid))
     end
@@ -1220,11 +1237,26 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
         !isempty(intersect(_pkgs, deps)) && return true
         return any(dep->in_deps(vcat(_pkgs, dep), dmap[dep], dmap), deps)
     end
+    depsmap_set = Dict{Base.PkgId, Int64}()
+    inverse_depsmap = Dict{Base.PkgId, Set{Base.PkgId}}()
+    active_queue = Vector{Base.PkgId}()
+
+
     for (pkg, deps) in depsmap
+        depsmap_set[pkg] = length(deps)
+        if length(deps) == 0
+            push!(active_queue, pkg)
+        else
+            for dep in deps
+                if !(dep in keys(inverse_depsmap))
+                    inverse_depsmap[dep] = Set{Base.PkgId}()
+                end
+                push!(inverse_depsmap[dep], pkg)
+            end
+        end
+
         if in_deps([pkg], deps, depsmap)
             push!(circular_deps, pkg)
-            was_processed_bool[pkg] = true
-            #notify(was_processed[pkg])
         end
     end
     if !isempty(circular_deps)
@@ -1309,38 +1341,19 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
         Base.LOADING_CACHE[] = Base.LoadingCache()
     end
 
-    depsmap_set = Dict{Base.PkgId, Set{Base.PkgId}}()
-    inverse_depsmap = Dict{Base.PkgId, Set{Base.PkgId}}()
-    active_queue = Deque{Base.PkgId}()
-
-    for pkg in keys(depsmap)
-        depsmap_set[pkg] = Set{Base.PkgId}()
-        if length(depsmap[pkg]) == 0
-            push!(active_queue, pkg)
-        else
-            for dep in depsmap[pkg]
-                push!(depsmap_set[pkg], dep)
-                if !(dep in keys(inverse_depsmap))
-                    inverse_depsmap[dep] = Set{Base.PkgId}()
-                end
-                push!(inverse_depsmap[dep], pkg)
-            end
-        end
-    end
-
     function finished_package(pkg::Base.PkgId)
-        was_processed_bool[pkg] = true
         if !(pkg in keys(inverse_depsmap))
             return
         end
         for inv_dep in inverse_depsmap[pkg]
-            delete!(depsmap_set[inv_dep], pkg)
-            if isempty(depsmap_set[inv_dep])
+            depsmap_set[inv_dep]-=1
+            if depsmap_set[inv_dep] == 0
                 push!(active_queue, inv_dep)
             end
         end
     end
 
+    headOfQueue = 0
     try
     ## precompilation loop
     while !isempty(active_queue)
@@ -1370,14 +1383,14 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
             any_dep_recompiled = any(map(dep->was_recompiled[dep], deps))
             is_stale = true
             if !circular && (queued || any_dep_recompiled || (!suspended && (is_stale = _is_stale!(stale_cache, paths, sourcepath))))
-                println("Processing: ", pkg)
+                #println("Processing: ", pkg)
                 is_direct_dep = pkg in direct_deps
 
                 # stderr monitoring
                 iob = Base.BufferStream()
 
                 push!(pkg_queue, pkg)
-                started[pkg] = true
+                #started[pkg] = true
                 if interrupted_or_done.set
                     finished_package(pkg)
                     continue
@@ -1421,7 +1434,7 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
             handle_interrupt(err_outer)
             finished_package(pkg)
         finally
-            println("finished pkg: ", pkg)
+            #println("finished pkg: ", pkg)
         end
     end
     catch err
