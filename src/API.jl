@@ -10,7 +10,6 @@ import LibGit2
 import Logging
 using Serialization
 using REPL.TerminalMenus
-using DataStructures
 import ..depots, ..depots1, ..logdir, ..devdir, ..printpkgstyle
 import ..Operations, ..GitTools, ..Pkg, ..Registry
 import ..can_fancyprint, ..pathrepr, ..isurl, ..PREV_ENV_PATH
@@ -1237,15 +1236,20 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
         !isempty(intersect(_pkgs, deps)) && return true
         return any(dep->in_deps(vcat(_pkgs, dep), dmap[dep], dmap), deps)
     end
+
+    #allocate working sets before parallelization
     depsmap_set = Dict{Base.PkgId, Int64}()
     inverse_depsmap = Dict{Base.PkgId, Set{Base.PkgId}}()
     active_queue = Vector{Base.PkgId}()
-
-
+    sizehint!(active_queue, length(keys(depsmap)))
+    head = 1
+    tail = 1
     for (pkg, deps) in depsmap
+        push!(active_queue, pkg)
         depsmap_set[pkg] = length(deps)
         if length(deps) == 0
-            push!(active_queue, pkg)
+            active_queue[tail] = pkg
+            tail+=1
         else
             for dep in deps
                 if !(dep in keys(inverse_depsmap))
@@ -1348,16 +1352,18 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
         for inv_dep in inverse_depsmap[pkg]
             depsmap_set[inv_dep]-=1
             if depsmap_set[inv_dep] == 0
-                push!(active_queue, inv_dep)
+                active_queue[tail] = inv_dep
+                tail += 1
             end
         end
     end
 
-    headOfQueue = 0
     try
     ## precompilation loop
-    while !isempty(active_queue)
-        pkg = popfirst!(active_queue)
+    for i in range(length=length(keys(depsmap)))
+        println("starting iteration: $i/$(length(keys(depsmap))), head $head tail $tail")
+        pkg = active_queue[head]
+        head += 1
         deps = depsmap[pkg]
         paths = Base.find_all_in_cache_path(pkg)
         sourcepath = Base.locate_package(pkg)
@@ -1438,6 +1444,8 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
         end
     end
     catch err
+        @error "Something went wrong" exception=(err, catch_backtrace())
+
         handle_interrupt(err)
     finally
         Base.LOADING_CACHE[] = nothing
