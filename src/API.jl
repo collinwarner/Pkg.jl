@@ -1293,131 +1293,43 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
 
     function handle_interrupt(err, in_printloop = false)
         notify(interrupted_or_done)
-        in_printloop || wait(t_print) # wait to let the print loop cease first
         if err isa InterruptException
-            lock(print_lock) do
-                println(io, " Interrupted: Exiting precompilation...")
-            end
             interrupted = true
         end
     end
 
     stderr_outputs = Dict{Base.PkgId,String}()
-    taskwaiting = Set{Base.PkgId}()
+    #taskwaiting = Set{Base.PkgId}()
 
-    function monitor_stderr(pkg, iob)
-        try
-            while isopen(iob)
-                str = readline(iob)
-                stderr_outputs[pkg] = get(stderr_outputs, pkg, "") * str * "\n"
-                if !in(pkg, taskwaiting) && occursin("waiting for IO to finish", str)
-                    !fancyprint && lock(print_lock) do
-                        println(io, pkg.name, color_string(" Waiting for background task / IO / timer.", Base.warn_color()))
-                    end
-                    push!(taskwaiting, pkg)
-                end
-                if !fancyprint && in(pkg, taskwaiting)
-                    lock(print_lock) do
-                        println(io, str)
-                    end
-                end
-            end
-        catch err
-            err isa InterruptException || rethrow()
-        end
-    end
+    #function monitor_stderr(pkg, iob)
+    #    try
+    #        while isopen(iob)
+    #            str = readline(iob)
+    #            stderr_outputs[pkg] = get(stderr_outputs, pkg, "") * str * "\n"
+    #            if !in(pkg, taskwaiting) && occursin("waiting for IO to finish", str)
+    #                #!fancyprint && lock(print_lock) do
+    #                #    println(io, pkg.name, color_string(" Waiting for background task / IO / timer.", Base.warn_color()))
+    #                #end
+    #                #push!(taskwaiting, pkg)
+    #            #end
+    #            #if !fancyprint && in(pkg, taskwaiting)
+    #            #    lock(print_lock) do
+    #            #        println(io, str)
+    #            #    end
+    #            #end
+    #        end
+    #    catch err
+    #        err isa InterruptException || rethrow()
+    # end
+    #end
 
-    # fix this as well the queue is going to be massvie
-    ## fancy print loop
-    t_print = @async begin
-        try
-            wait(first_started)
-            (isempty(pkg_queue) || interrupted_or_done.set) && return
-            fancyprint && lock(print_lock) do
-                printpkgstyle(io, :Precompiling, target)
-                print(io, ansi_disablecursor)
-            end
-            t = Timer(0; interval=1/10)
-            anim_chars = ["◐","◓","◑","◒"]
-            i = 1
-            last_length = 0
-            bar = MiniProgressBar(; indent=2, header = "Progress", color = Base.info_color(), percentage=false, always_reprint=true)
-            n_total = length(depsmap)
-            bar.max = n_total - n_already_precomp
-            final_loop = false
-            n_print_rows = 0
-            while !printloop_should_exit
-                lock(print_lock) do
-                    term_size = Base.displaysize(ctx.io)::Tuple{Int,Int}
-                    num_deps_show = term_size[1] - 3
-                    pkg_queue_show = if !interrupted_or_done.set && length(pkg_queue) > num_deps_show
-                        last(pkg_queue, num_deps_show)
-                    else
-                        pkg_queue
-                    end
-                    str_ = sprint() do iostr
-                        if i > 1
-                            print(iostr, ansi_moveup(n_print_rows), ansi_movecol1, ansi_cleartoend)
-                        end
-                        bar.current = n_done - n_already_precomp
-                        bar.max = n_total - n_already_precomp
-                        final_loop || print(iostr, sprint(io -> show_progress(io, bar; termwidth = displaysize(ctx.io)[2]); context=io), "\n")
-                        for dep in pkg_queue_show
-                            loaded = warn_loaded && haskey(Base.loaded_modules, dep)
-                            _name = haskey(exts, dep) ? string(exts[dep], " → ", dep.name) : dep.name
-                            name = dep in direct_deps ? _name : string(color_string(_name, :light_black))
-                            if dep in precomperr_deps
-                                print(iostr, color_string("  ? ", Base.warn_color()), name, "\n")
-                            elseif haskey(failed_deps, dep)
-                                print(iostr, color_string("  ✗ ", Base.error_color()), name, "\n")
-                            elseif was_recompiled[dep]
-                                !loaded && interrupted_or_done.set && continue
-                                print(iostr, color_string("  ✓ ", loaded ? Base.warn_color() : :green), name, "\n")
-                                loaded || @async begin # keep successful deps visible for short period
-                                    sleep(1);
-                                    filter!(!isequal(dep), pkg_queue)
-                                end
-                            elseif started[dep]
-                                # Offset each spinner animation using the first character in the package name as the seed.
-                                # If not offset, on larger terminal fonts it looks odd that they all sync-up
-                                anim_char = anim_chars[(i + Int(dep.name[1])) % length(anim_chars) + 1]
-                                anim_char_colored = dep in direct_deps ? anim_char : color_string(anim_char, :light_black)
-                                waiting = if dep in taskwaiting
-                                    color_string(" Waiting for background task / IO / timer. Interrupt to inspect", Base.warn_color())
-                                else
-                                    ""
-                                end
-                                print(iostr, "  $anim_char_colored $name$waiting\n")
-                            else
-                                print(iostr, "    $name\n")
-                            end
-                        end
-                    end
-                    last_length = length(pkg_queue_show)
-                    n_print_rows = count("\n", str_)
-                    print(io, str_)
-                end
-                printloop_should_exit = interrupted_or_done.set && final_loop
-                final_loop = interrupted_or_done.set # ensures one more loop to tidy last task after finish
-                i += 1
-                wait(t)
-            end
-        catch err
-            handle_interrupt(err, true)
-        finally
-            fancyprint && print(io, ansi_enablecursor)
-        end
-    end
     tasks = Task[]
     if !_from_loading
         Base.LOADING_CACHE[] = Base.LoadingCache()
     end
 
-    #@show depsmap
     ## precompilation loop
     for (pkg, deps) in depsmap
-        #println("dependency")
-        #@show (pkg, deps)
         paths = Base.find_all_in_cache_path(pkg)
         sourcepath = Base.locate_package(pkg)
         if sourcepath === nothing
@@ -1448,17 +1360,15 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
                 is_stale = true
                 if !circular && (queued || any_dep_recompiled || (!suspended && (is_stale = _is_stale!(stale_cache, paths, sourcepath))))
                     Base.acquire(parallel_limiter)
+                    println("processing: ", pkg)
                     is_direct_dep = pkg in direct_deps
 
                     # stderr monitoring
-                    #iob = Base.BufferStream()
+                    iob = Base.BufferStream()
                     #t_monitor = @async monitor_stderr(pkg, iob)
 
                     #_name = haskey(exts, pkg) ? string(exts[pkg], " → ", pkg.name) : pkg.name
                     #name = is_direct_dep ? _name : string(color_string(_name, :light_black))
-                    #!fancyprint && lock(print_lock) do
-                    #    isempty(pkg_queue) && printpkgstyle(io, :Precompiling, target)
-                    #end
                     push!(pkg_queue, pkg)
                     started[pkg] = true
                     #fancyprint && notify(first_started)
@@ -1476,27 +1386,17 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
                         if ret isa Base.PrecompilableError
                             push!(precomperr_deps, pkg)
                             precomp_queue!(get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid))
-                            #!fancyprint && lock(print_lock) do
-                            #    println(io, t_str, color_string("  ? ", Base.warn_color()), name)
-                            #end
                         else
                             queued && precomp_dequeue!(get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid))
-                            #!fancyprint && lock(print_lock) do
-                            
-                            #println(io, t_str, color_string("  ✓ ", loaded ? Base.warn_color() : :green), name)
-                            #end
                             was_recompiled[pkg] = true
                         end
                         loaded && (n_loaded += 1)
                     catch err
-                        #close(iob)
+                        close(iob)
                         #wait(t_monitor)
                         if err isa ErrorException || (err isa ArgumentError && startswith(err.msg, "Invalid header in cache file"))
                             failed_deps[pkg] = (strict || is_direct_dep) ? string(sprint(showerror, err), "\n", get(stderr_outputs, pkg, "")) : ""
-                            #delete!(stderr_outputs, pkg) # so it's not shown as warnings, given error report
-                            #!fancyprint && lock(print_lock) do
-                            #    println(io, timing ? " "^9 : "", color_string("  ✗ ", Base.error_color()), name)
-                            #end
+                            delete!(stderr_outputs, pkg) # so it's not shown as warnings, given error report
                             queued && precomp_dequeue!(get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid))
                             precomp_suspend!(get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid))
                         else
@@ -1515,6 +1415,7 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
                 handle_interrupt(err_outer)
                 notify(was_processed[pkg])
             finally
+                println("finished processing: ", pkg)
                 filter!(!istaskdone, tasks)
                 length(tasks) == 1 && notify(interrupted_or_done)
             end
@@ -1531,7 +1432,7 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
     end
     notify(first_started) # in cases of no-op or !fancyprint
     save_precompile_state() # save lists to scratch space
-    fancyprint && wait(t_print)
+    # fancyprint && wait(t_print)
     quick_exit = !all(istaskdone, tasks) || interrupted # if some not finished internal error is likely
     seconds_elapsed = round(Int, (time_ns() - time_start) / 1e9)
     ndeps = count(values(was_recompiled))
