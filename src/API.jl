@@ -1129,6 +1129,7 @@ end
     end
 end =#
 
+mutable struct AtomicPointers; @atomic head::Int64; @atomic tail::Int64 end;
 function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool=false,
                     strict::Bool=false, warn_loaded = true, already_instantiated = false, timing::Bool = false,
                     _from_loading::Bool=false, kwargs...)
@@ -1242,14 +1243,13 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
     inverse_depsmap = Dict{Base.PkgId, Set{Base.PkgId}}()
     active_queue = Vector{Base.PkgId}()
     sizehint!(active_queue, length(keys(depsmap)))
-    head = 1
-    tail = 1
+    pointers = AtomicPointers(0, 0)
     for (pkg, deps) in depsmap
         push!(active_queue, pkg)
         depsmap_set[pkg] = length(deps)
         if length(deps) == 0
+            tail = @atomic pointers.tail += 1
             active_queue[tail] = pkg
-            tail+=1
         else
             for dep in deps
                 if !(dep in keys(inverse_depsmap))
@@ -1315,7 +1315,7 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
     first_started = Base.Event()
     printloop_should_exit::Bool = !fancyprint # exit print loop immediately if not fancy printing
     interrupted_or_done = Base.Event()
-
+    println("interrupted_or_done: $(interrupted_or_done.set)")
     function color_string(cstr::String, col::Symbol)
         enable_ansi  = get(Base.text_colors, col, Base.text_colors[:default])
         disable_ansi = get(Base.disable_text_style, col, Base.text_colors[:default])
@@ -1345,25 +1345,32 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
         Base.LOADING_CACHE[] = Base.LoadingCache()
     end
 
-    function finished_package(pkg::Base.PkgId)
-        if !(pkg in keys(inverse_depsmap))
-            return
-        end
-        for inv_dep in inverse_depsmap[pkg]
-            depsmap_set[inv_dep]-=1
-            if depsmap_set[inv_dep] == 0
-                active_queue[tail] = inv_dep
-                tail += 1
-            end
-        end
-    end
 
+
+    num_pkgs = length(keys(depsmap))
+    num_threads = 4
+    for _ in range(length=num_threads)
+    task = @async begin
     try
     ## precompilation loop
-    for i in range(length=length(keys(depsmap)))
-        println("starting iteration: $i/$(length(keys(depsmap))), head $head tail $tail")
+    head = @atomic pointers.head += 1
+    function finished_package(pkg::Base.PkgId)
+        println("finished pkg $pkg")
+        if pkg in keys(inverse_depsmap)
+            for inv_dep in inverse_depsmap[pkg]
+                depsmap_set[inv_dep]-=1
+                if depsmap_set[inv_dep] == 0
+                    tail = @atomic pointers.tail += 1
+                    active_queue[tail] = inv_dep
+                end
+            end
+        end
+        head = @atomic pointers.head += 1
+    end
+    while head <= num_pkgs
+    #for i in range(length=length(keys(depsmap))
+        println("starting iteration: head $head length $num_pkgs")
         pkg = active_queue[head]
-        head += 1
         deps = depsmap[pkg]
         paths = Base.find_all_in_cache_path(pkg)
         sourcepath = Base.locate_package(pkg)
@@ -1378,7 +1385,6 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
             continue
         end
 
-        try
             loaded = haskey(Base.loaded_modules, pkg)
             pkgspec = get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid)
             suspended = precomp_suspended(pkgspec)
@@ -1416,8 +1422,11 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
                     end
                     loaded && (n_loaded += 1)
                 catch err
+                    
                     close(iob)
                     if err isa ErrorException || (err isa ArgumentError && startswith(err.msg, "Invalid header in cache file"))
+            @error "Something went wrong" exception=(err_outer, catch_backtrace())
+
                         failed_deps[pkg] = (strict || is_direct_dep) ? string(sprint(showerror, err), "\n", get(stderr_outputs, pkg, "")) : ""
                         delete!(stderr_outputs, pkg) # so it's not shown as warnings, given error report
                         queued && precomp_dequeue!(get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid))
@@ -1434,15 +1443,23 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
             end
             n_done += 1
             finished_package(pkg)
+        end
         catch err_outer
             @error "Something went wrong" exception=(err_outer, catch_backtrace())
-            println("error: ", err_outer)
             handle_interrupt(err_outer)
             finished_package(pkg)
         finally
-            #println("finished pkg: ", pkg)
+            filter!(!istaskdone, tasks)
+            length(tasks) == 1 && notify(interrupted_or_done)
         end
     end
+
+push!(tasks, task)
+end
+println("tasks are empty: $(isempty(tasks))")
+    isempty(tasks) && notify(interrupted_or_done)
+    try
+        wait(interrupted_or_done)
     catch err
         @error "Something went wrong" exception=(err, catch_backtrace())
 
