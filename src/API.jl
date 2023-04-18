@@ -1170,7 +1170,7 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
             exts[ext] = pkg.name
         end
     end
-
+    
     # if the active environment is a package, add that
     ctx_env_pkg = ctx.env.pkg
     if ctx_env_pkg !== nothing && isfile( joinpath( dirname(ctx.env.project_file), "src", "$(ctx_env_pkg.name).jl") )
@@ -1197,11 +1197,13 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
 
     # initialize signalling
     started = Dict{Base.PkgId,Bool}()
-    was_processed = Dict{Base.PkgId,Base.Event}()
+    #was_processed = Dict{Base.PkgId,Base.Event}()
+    was_processed_bool = Dict{Base.PkgId, Bool}()
     was_recompiled = Dict{Base.PkgId,Bool}()
     for pkgid in keys(depsmap)
         started[pkgid] = false
-        was_processed[pkgid] = Base.Event()
+        #was_processed[pkgid] = Base.Event()
+        was_processed_bool[pkgid] = false
         was_recompiled[pkgid] = false
         push!(pkg_specs, get_or_make_pkgspec(pkg_specs, ctx, pkgid.uuid))
     end
@@ -1220,7 +1222,8 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
     for (pkg, deps) in depsmap
         if in_deps([pkg], deps, depsmap)
             push!(circular_deps, pkg)
-            notify(was_processed[pkg])
+            was_processed_bool[pkg] = true
+            #notify(was_processed[pkg])
         end
     end
     if !isempty(circular_deps)
@@ -1299,57 +1302,64 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
     end
 
     stderr_outputs = Dict{Base.PkgId,String}()
-    #taskwaiting = Set{Base.PkgId}()
-
-    #function monitor_stderr(pkg, iob)
-    #    try
-    #        while isopen(iob)
-    #            str = readline(iob)
-    #            stderr_outputs[pkg] = get(stderr_outputs, pkg, "") * str * "\n"
-    #            if !in(pkg, taskwaiting) && occursin("waiting for IO to finish", str)
-    #                #!fancyprint && lock(print_lock) do
-    #                #    println(io, pkg.name, color_string(" Waiting for background task / IO / timer.", Base.warn_color()))
-    #                #end
-    #                #push!(taskwaiting, pkg)
-    #            #end
-    #            #if !fancyprint && in(pkg, taskwaiting)
-    #            #    lock(print_lock) do
-    #            #        println(io, str)
-    #            #    end
-    #            #end
-    #        end
-    #    catch err
-    #        err isa InterruptException || rethrow()
-    # end
-    #end
 
     tasks = Task[]
     if !_from_loading
         Base.LOADING_CACHE[] = Base.LoadingCache()
     end
 
-    ## precompilation loop
-    for (pkg, deps) in depsmap
-        paths = Base.find_all_in_cache_path(pkg)
-        sourcepath = Base.locate_package(pkg)
-        if sourcepath === nothing
-            failed_deps[pkg] = "Error: Missing source file for $(pkg)"
-            notify(was_processed[pkg])
-            continue
+    inverse_depsmap = Dict{Base.PkgId, Set{Base.PkgId}}()
+    active_queue = Vector()
+    for pkg in depsmap
+        if length(depsmap[pkg]) == 0
+            push!(active_queue, pkg)
+        else
+            for dep in depsmap[pkg]
+                push!(inverse_depsmap[dep], pkg)
+            end
         end
-        # Heuristic for when precompilation is disabled
-        if occursin(r"\b__precompile__\(\s*false\s*\)", read(sourcepath, String))
-            notify(was_processed[pkg])
-            continue
-        end
+    end
 
-        task = @async begin
+    try
+    ## precompilation loop
+    all_pkgs_done = false
+    while !all_pkgs_done
+        all_pkgs_done = true
+        for (pkg, deps) in depsmap
+            if was_processed_bool[pkg]
+                continue
+            end
+            paths = Base.find_all_in_cache_path(pkg)
+            sourcepath = Base.locate_package(pkg)
+            if sourcepath === nothing
+                failed_deps[pkg] = "Error: Missing source file for $(pkg)"
+                was_processed_bool[pkg] = true
+                #notify(was_processed[pkg])
+                continue
+            end
+            # Heuristic for when precompilation is disabled
+            if occursin(r"\b__precompile__\(\s*false\s*\)", read(sourcepath, String))
+                was_processed_bool[pkg] = true
+                #notify(was_processed[pkg])
+                continue
+            end
+
+            #task = @async begin
             try
                 loaded = haskey(Base.loaded_modules, pkg)
+                all_done = true
                 for dep in deps # wait for deps to finish
-                    wait(was_processed[dep])
+                    if !was_processed_bool[dep]
+                        all_done = false
+                        all_pkgs_done = false
+                        break
+                    end
+                    #was_processed_bool[dep] = true
+#                    wait(was_processed[dep])
                 end
-
+                if !all_done
+                    continue
+                end
                 pkgspec = get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid)
                 suspended = precomp_suspended(pkgspec)
                 queued = precomp_queued(pkgspec)
@@ -1359,23 +1369,21 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
                 any_dep_recompiled = any(map(dep->was_recompiled[dep], deps))
                 is_stale = true
                 if !circular && (queued || any_dep_recompiled || (!suspended && (is_stale = _is_stale!(stale_cache, paths, sourcepath))))
-                    Base.acquire(parallel_limiter)
-                    println("processing: ", pkg)
+                    #Base.acquire(parallel_limiter)
+                    println("Processing: ", pkg)
                     is_direct_dep = pkg in direct_deps
 
                     # stderr monitoring
                     iob = Base.BufferStream()
-                    #t_monitor = @async monitor_stderr(pkg, iob)
 
-                    #_name = haskey(exts, pkg) ? string(exts[pkg], " → ", pkg.name) : pkg.name
-                    #name = is_direct_dep ? _name : string(color_string(_name, :light_black))
                     push!(pkg_queue, pkg)
                     started[pkg] = true
-                    #fancyprint && notify(first_started)
                     if interrupted_or_done.set
-                        notify(was_processed[pkg])
-                        Base.release(parallel_limiter)
-                        return
+                        was_processed_bool[pkg] = true
+#                        notify(was_processed[pkg])
+                        #Base.release(parallel_limiter)
+                        #return
+                        continue
                     end
                     try
                         t = @elapsed ret = Logging.with_logger(Logging.NullLogger()) do
@@ -1393,7 +1401,6 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
                         loaded && (n_loaded += 1)
                     catch err
                         close(iob)
-                        #wait(t_monitor)
                         if err isa ErrorException || (err isa ArgumentError && startswith(err.msg, "Invalid header in cache file"))
                             failed_deps[pkg] = (strict || is_direct_dep) ? string(sprint(showerror, err), "\n", get(stderr_outputs, pkg, "")) : ""
                             delete!(stderr_outputs, pkg) # so it's not shown as warnings, given error report
@@ -1403,28 +1410,30 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
                             rethrow()
                         end
                     finally
-                        Base.release(parallel_limiter)
+                        #Base.release(parallel_limiter)
                     end
                 else
                     is_stale || (n_already_precomp += 1)
                     suspended && push!(skipped_deps, pkg)
                 end
                 n_done += 1
-                notify(was_processed[pkg])
+                was_processed_bool[pkg] = true
+#                notify(was_processed[pkg])
             catch err_outer
                 handle_interrupt(err_outer)
-                notify(was_processed[pkg])
+                was_processed_bool[pkg] = true
+#                notify(was_processed[pkg])
             finally
                 println("finished processing: ", pkg)
                 filter!(!istaskdone, tasks)
                 length(tasks) == 1 && notify(interrupted_or_done)
             end
-        end
-        push!(tasks, task)
+        #end
+        #push!(tasks, task)
     end
-    isempty(tasks) && notify(interrupted_or_done)
-    try
-        wait(interrupted_or_done)
+end
+    #isempty(tasks) && notify(interrupted_or_done)
+        #wait(interrupted_or_done)
     catch err
         handle_interrupt(err)
     finally
