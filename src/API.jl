@@ -10,7 +10,7 @@ import LibGit2
 import Logging
 using Serialization
 using REPL.TerminalMenus
-
+using DataStructures
 import ..depots, ..depots1, ..logdir, ..devdir, ..printpkgstyle
 import ..Operations, ..GitTools, ..Pkg, ..Registry
 import ..can_fancyprint, ..pathrepr, ..isurl, ..PREV_ENV_PATH
@@ -1112,6 +1112,7 @@ function get_or_make_pkgspec(pkgspecs::Vector{PackageSpec}, ctx::Context, uuid)
     end
 end
 
+
 function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool=false,
                     strict::Bool=false, warn_loaded = true, already_instantiated = false, timing::Bool = false,
                     _from_loading::Bool=false, kwargs...)
@@ -1308,132 +1309,121 @@ function precompile(ctx::Context, pkgs::Vector{PackageSpec}; internal_call::Bool
         Base.LOADING_CACHE[] = Base.LoadingCache()
     end
 
+    depsmap_set = Dict{Base.PkgId, Set{Base.PkgId}}()
     inverse_depsmap = Dict{Base.PkgId, Set{Base.PkgId}}()
-    active_queue = Vector()
-    for pkg in depsmap
+    active_queue = Deque{Base.PkgId}()
+
+    for pkg in keys(depsmap)
+        depsmap_set[pkg] = Set{Base.PkgId}()
         if length(depsmap[pkg]) == 0
             push!(active_queue, pkg)
         else
             for dep in depsmap[pkg]
+                push!(depsmap_set[pkg], dep)
+                if !(dep in keys(inverse_depsmap))
+                    inverse_depsmap[dep] = Set{Base.PkgId}()
+                end
                 push!(inverse_depsmap[dep], pkg)
+            end
+        end
+    end
+
+    function finished_package(pkg::Base.PkgId)
+        was_processed_bool[pkg] = true
+        if !(pkg in keys(inverse_depsmap))
+            return
+        end
+        for inv_dep in inverse_depsmap[pkg]
+            delete!(depsmap_set[inv_dep], pkg)
+            if isempty(depsmap_set[inv_dep])
+                push!(active_queue, inv_dep)
             end
         end
     end
 
     try
     ## precompilation loop
-    all_pkgs_done = false
-    while !all_pkgs_done
-        all_pkgs_done = true
-        for (pkg, deps) in depsmap
-            if was_processed_bool[pkg]
-                continue
-            end
-            paths = Base.find_all_in_cache_path(pkg)
-            sourcepath = Base.locate_package(pkg)
-            if sourcepath === nothing
-                failed_deps[pkg] = "Error: Missing source file for $(pkg)"
-                was_processed_bool[pkg] = true
-                #notify(was_processed[pkg])
-                continue
-            end
-            # Heuristic for when precompilation is disabled
-            if occursin(r"\b__precompile__\(\s*false\s*\)", read(sourcepath, String))
-                was_processed_bool[pkg] = true
-                #notify(was_processed[pkg])
-                continue
-            end
+    while !isempty(active_queue)
+        pkg = popfirst!(active_queue)
+        deps = depsmap[pkg]
+        paths = Base.find_all_in_cache_path(pkg)
+        sourcepath = Base.locate_package(pkg)
+        if sourcepath === nothing
+            failed_deps[pkg] = "Error: Missing source file for $(pkg)"
+            finished_package(pkg)
+            continue
+        end
+        # Heuristic for when precompilation is disabled
+        if occursin(r"\b__precompile__\(\s*false\s*\)", read(sourcepath, String))
+            finished_package(pkg)
+            continue
+        end
 
-            #task = @async begin
-            try
-                loaded = haskey(Base.loaded_modules, pkg)
-                all_done = true
-                for dep in deps # wait for deps to finish
-                    if !was_processed_bool[dep]
-                        all_done = false
-                        all_pkgs_done = false
-                        break
-                    end
-                    #was_processed_bool[dep] = true
-#                    wait(was_processed[dep])
-                end
-                if !all_done
+        try
+            loaded = haskey(Base.loaded_modules, pkg)
+            pkgspec = get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid)
+            suspended = precomp_suspended(pkgspec)
+            queued = precomp_queued(pkgspec)
+
+            circular = pkg in circular_deps
+            # skip stale checking and force compilation if any dep was recompiled in this session
+            any_dep_recompiled = any(map(dep->was_recompiled[dep], deps))
+            is_stale = true
+            if !circular && (queued || any_dep_recompiled || (!suspended && (is_stale = _is_stale!(stale_cache, paths, sourcepath))))
+                println("Processing: ", pkg)
+                is_direct_dep = pkg in direct_deps
+
+                # stderr monitoring
+                iob = Base.BufferStream()
+
+                push!(pkg_queue, pkg)
+                started[pkg] = true
+                if interrupted_or_done.set
+                    finished_package(pkg)
                     continue
                 end
-                pkgspec = get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid)
-                suspended = precomp_suspended(pkgspec)
-                queued = precomp_queued(pkgspec)
-
-                circular = pkg in circular_deps
-                # skip stale checking and force compilation if any dep was recompiled in this session
-                any_dep_recompiled = any(map(dep->was_recompiled[dep], deps))
-                is_stale = true
-                if !circular && (queued || any_dep_recompiled || (!suspended && (is_stale = _is_stale!(stale_cache, paths, sourcepath))))
-                    #Base.acquire(parallel_limiter)
-                    println("Processing: ", pkg)
-                    is_direct_dep = pkg in direct_deps
-
-                    # stderr monitoring
-                    iob = Base.BufferStream()
-
-                    push!(pkg_queue, pkg)
-                    started[pkg] = true
-                    if interrupted_or_done.set
-                        was_processed_bool[pkg] = true
-#                        notify(was_processed[pkg])
-                        #Base.release(parallel_limiter)
-                        #return
-                        continue
+                try
+                    t = @elapsed ret = Logging.with_logger(Logging.NullLogger()) do
+                        # capture stderr, send stdout to devnull, don't skip loaded modules
+                        Base.compilecache(pkg, sourcepath, iob, devnull, false)
                     end
-                    try
-                        t = @elapsed ret = Logging.with_logger(Logging.NullLogger()) do
-                            # capture stderr, send stdout to devnull, don't skip loaded modules
-                            Base.compilecache(pkg, sourcepath, iob, devnull, false)
-                        end
-                        t_str = timing ? string(lpad(round(t * 1e3, digits = 1), 9), " ms") : ""
-                        if ret isa Base.PrecompilableError
-                            push!(precomperr_deps, pkg)
-                            precomp_queue!(get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid))
-                        else
-                            queued && precomp_dequeue!(get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid))
-                            was_recompiled[pkg] = true
-                        end
-                        loaded && (n_loaded += 1)
-                    catch err
-                        close(iob)
-                        if err isa ErrorException || (err isa ArgumentError && startswith(err.msg, "Invalid header in cache file"))
-                            failed_deps[pkg] = (strict || is_direct_dep) ? string(sprint(showerror, err), "\n", get(stderr_outputs, pkg, "")) : ""
-                            delete!(stderr_outputs, pkg) # so it's not shown as warnings, given error report
-                            queued && precomp_dequeue!(get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid))
-                            precomp_suspend!(get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid))
-                        else
-                            rethrow()
-                        end
-                    finally
-                        #Base.release(parallel_limiter)
+                    t_str = timing ? string(lpad(round(t * 1e3, digits = 1), 9), " ms") : ""
+                    if ret isa Base.PrecompilableError
+                        push!(precomperr_deps, pkg)
+                        precomp_queue!(get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid))
+                    else
+                        queued && precomp_dequeue!(get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid))
+                        was_recompiled[pkg] = true
                     end
-                else
-                    is_stale || (n_already_precomp += 1)
-                    suspended && push!(skipped_deps, pkg)
+                    loaded && (n_loaded += 1)
+                catch err
+                    close(iob)
+                    if err isa ErrorException || (err isa ArgumentError && startswith(err.msg, "Invalid header in cache file"))
+                        failed_deps[pkg] = (strict || is_direct_dep) ? string(sprint(showerror, err), "\n", get(stderr_outputs, pkg, "")) : ""
+                        delete!(stderr_outputs, pkg) # so it's not shown as warnings, given error report
+                        queued && precomp_dequeue!(get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid))
+                        precomp_suspend!(get_or_make_pkgspec(pkg_specs, ctx, pkg.uuid))
+                    else
+                        rethrow()
+                    end
+                finally
+                    #Base.release(parallel_limiter)
                 end
-                n_done += 1
-                was_processed_bool[pkg] = true
-#                notify(was_processed[pkg])
-            catch err_outer
-                handle_interrupt(err_outer)
-                was_processed_bool[pkg] = true
-#                notify(was_processed[pkg])
-            finally
-                println("finished processing: ", pkg)
-                filter!(!istaskdone, tasks)
-                length(tasks) == 1 && notify(interrupted_or_done)
+            else
+                is_stale || (n_already_precomp += 1)
+                suspended && push!(skipped_deps, pkg)
             end
-        #end
-        #push!(tasks, task)
+            n_done += 1
+            finished_package(pkg)
+        catch err_outer
+            @error "Something went wrong" exception=(err_outer, catch_backtrace())
+            println("error: ", err_outer)
+            handle_interrupt(err_outer)
+            finished_package(pkg)
+        finally
+            println("finished pkg: ", pkg)
+        end
     end
-end
-    #isempty(tasks) && notify(interrupted_or_done)
-        #wait(interrupted_or_done)
     catch err
         handle_interrupt(err)
     finally
@@ -1441,7 +1431,6 @@ end
     end
     notify(first_started) # in cases of no-op or !fancyprint
     save_precompile_state() # save lists to scratch space
-    # fancyprint && wait(t_print)
     quick_exit = !all(istaskdone, tasks) || interrupted # if some not finished internal error is likely
     seconds_elapsed = round(Int, (time_ns() - time_start) / 1e9)
     ndeps = count(values(was_recompiled))
